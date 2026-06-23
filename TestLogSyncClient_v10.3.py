@@ -20,6 +20,11 @@ class App:
         try: from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
         except: pass
         ap=os.path.dirname(sys.executable if getattr(sys,'frozen',False) else os.path.abspath(__file__))
+        # 图标
+        try:
+            ico=os.path.join(ap,"sync.ico")
+            if os.path.exists(ico): root.iconbitmap(ico)
+        except: pass
         self.cfg_file=os.path.join(ap,"config.ini"); self.cfg=configparser.ConfigParser()
         self.line_var=tk.StringVar(value="A03"); self.station_var=tk.StringVar(value="AT")
         self.device_var=tk.StringVar(value="AT_01"); self.source_var=tk.StringVar(); self.target_var=tk.StringVar()

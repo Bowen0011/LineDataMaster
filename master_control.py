@@ -42,16 +42,39 @@ class TriggerManager:
 
 class AnalyzerBridge:
     REPO_URL = "https://raw.githubusercontent.com/Bowen0011/AT-Audio-Test-Analyzer/main/at_analyzer.py"
+    EXE_NAME = "AudioTest分析工具.exe"
 
     @classmethod
     def _find_analyzer(cls):
-        """查找 at_analyzer.py，优先同目录，其次 ../AT-Audio-Test-Analyzer/"""
-        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "at_analyzer.py")
-        if os.path.exists(local):
-            return local
-        parent = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "AT-Audio-Test-Analyzer", "at_analyzer.py")
-        if os.path.exists(parent):
-            return parent
+        """查找分析工具：at_analyzer.py 或 AudioTest分析工具.exe"""
+        base = os.path.dirname(os.path.abspath(__file__))
+
+        # 1. 同目录 .py
+        local_py = os.path.join(base, "at_analyzer.py")
+        if os.path.exists(local_py):
+            return local_py
+
+        # 2. ../AT-Audio-Test-Analyzer/at_analyzer.py
+        parent_py = os.path.join(base, "..", "AT-Audio-Test-Analyzer", "at_analyzer.py")
+        if os.path.exists(parent_py):
+            return parent_py
+
+        # 3. 同目录 .exe → 找它旁边的 .py
+        local_exe = os.path.join(base, cls.EXE_NAME)
+        if os.path.exists(local_exe):
+            exe_dir = os.path.dirname(os.path.abspath(local_exe))
+            nearby_py = os.path.join(exe_dir, "at_analyzer.py")
+            if os.path.exists(nearby_py):
+                return nearby_py
+
+        # 4. ../AT-Audio-Test-Analyzer/ 下的 exe
+        parent_exe = os.path.join(base, "..", "AT-Audio-Test-Analyzer", cls.EXE_NAME)
+        if os.path.exists(parent_exe):
+            exe_dir = os.path.dirname(os.path.abspath(parent_exe))
+            nearby_py = os.path.join(exe_dir, "at_analyzer.py")
+            if os.path.exists(nearby_py):
+                return nearby_py
+
         return None
 
     @classmethod
@@ -87,9 +110,15 @@ class AnalyzerBridge:
 class App:
     def __init__(self, root):
         self.root=root; root.title("产线数据采集主控 v2.2"); root.geometry("960x700"); root.minsize(860,550); root.configure(bg=STYLE["bg"])
+        # 应用目录
+        ad=os.path.dirname(sys.executable if getattr(sys,'frozen',False) else os.path.abspath(__file__))
+        # 图标
+        try:
+            ico=os.path.join(ad,"master.ico")
+            if os.path.exists(ico): root.iconbitmap(ico)
+        except: pass
         try: from ctypes import windll; windll.shcore.SetProcessDpiAwareness(1)
         except: pass
-        ad=os.path.dirname(sys.executable if getattr(sys,'frozen',False) else os.path.abspath(__file__))
         self.cfg_file=os.path.join(ad,"config.ini"); self.cfg=configparser.ConfigParser()
         self.server=tk.StringVar(); self.date=tk.StringVar(value=datetime.date.today().isoformat())
         self.stations=[]  # [{line, station, enabled}]
