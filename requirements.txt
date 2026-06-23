@@ -1,0 +1,5 @@
+# 产线数据采集主控面板 - 依赖
+# Python 3.8+, tkinter 为 Python 原生库无需安装
+
+# AT Audio Test Analyzer 依赖（分析阶段）
+matplotlib>=3.5.0
