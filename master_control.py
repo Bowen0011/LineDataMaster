@@ -41,24 +41,47 @@ class TriggerManager:
 
 
 class AnalyzerBridge:
-    @staticmethod
-    def run(data_path, out_dir, log_cb):
-        try:
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            import at_analyzer as aa
-            log_cb("🔍 解析中..."); r,sk,sf=aa.parse_source(data_path)
-            if not r: raise ValueError("无有效记录")
-            log_cb(f"📊 {len(r)}行 {len(sf)}站别")
-            a=aa.analyze(r); os.makedirs(out_dir, exist_ok=True)
-            hp=aa.make_html(a, out_dir, os.path.join(out_dir,"report.html"), os.path.basename(data_path))
-            log_cb(f"✅ {hp}"); return hp,a
-        except ImportError:
-            log_cb("⚠️ 子进程调用...")
-            an=os.path.join(os.path.dirname(os.path.abspath(__file__)),"..","AT-Audio-Test-Analyzer","at_analyzer.py")
-            code=f'import sys;sys.path.insert(0,r"{os.path.dirname(an)}");import at_analyzer as aa;r,sk,sf=aa.parse_source(r"{data_path}");a=aa.analyze(r);hp=aa.make_html(a,r"{out_dir}",r"{os.path.join(out_dir,"report.html")}",r"{os.path.basename(data_path)}");print("OK:"+hp)'
-            res=subprocess.run([sys.executable,"-c",code],capture_output=True,text=True,timeout=300)
-            if res.returncode==0 and "OK:" in res.stdout: return res.stdout.split("OK:")[1].strip(),None
-            raise RuntimeError(res.stderr)
+    REPO_URL = "https://raw.githubusercontent.com/Bowen0011/AT-Audio-Test-Analyzer/main/at_analyzer.py"
+
+    @classmethod
+    def _find_analyzer(cls):
+        """查找 at_analyzer.py，优先同目录，其次 ../AT-Audio-Test-Analyzer/"""
+        local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "at_analyzer.py")
+        if os.path.exists(local):
+            return local
+        parent = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "AT-Audio-Test-Analyzer", "at_analyzer.py")
+        if os.path.exists(parent):
+            return parent
+        return None
+
+    @classmethod
+    def run(cls, data_path, out_dir, log_cb):
+        analyzer_path = cls._find_analyzer()
+        if not analyzer_path:
+            msg = (
+                "未找到分析工具 at_analyzer.py！\n\n"
+                "请下载并放到主控同目录：\n"
+                f"  {cls.REPO_URL}\n\n"
+                "或命令行执行：\n"
+                f"  curl -O {cls.REPO_URL}"
+            )
+            raise FileNotFoundError(msg)
+
+        analyzer_dir = os.path.dirname(analyzer_path)
+        code = (
+            f'import sys; sys.path.insert(0, r"{analyzer_dir}")\n'
+            f'import at_analyzer as aa\n'
+            f'r, sk, sf = aa.parse_source(r"{data_path}")\n'
+            f'if not r: raise ValueError("无有效记录")\n'
+            f'a = aa.analyze(r)\n'
+            f'import os; os.makedirs(r"{out_dir}", exist_ok=True)\n'
+            f'hp = aa.make_html(a, r"{out_dir}", r"{os.path.join(out_dir, "report.html")}", r"{os.path.basename(data_path)}")\n'
+            f'print("OK:" + hp)\n'
+        )
+        res = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
+        if res.returncode == 0 and "OK:" in res.stdout:
+            return res.stdout.split("OK:")[1].strip(), None
+        raise RuntimeError(res.stderr or res.stdout)
 
 
 class App:
@@ -266,6 +289,19 @@ class App:
         else: self.pl.config(text="❌ 全部失败"); self._sb("全部失败")
 
     def _run_analysis(self):
+        # 启动前检查分析工具
+        if not AnalyzerBridge._find_analyzer():
+            self.pl.config(text="❌ 未找到 at_analyzer.py")
+            self._sb("❌ 请下载 at_analyzer.py 放到主控同目录")
+            messagebox.showwarning(
+                "缺少分析工具",
+                "未找到 at_analyzer.py！\n\n"
+                "请从 GitHub 下载并放到主控同目录：\n"
+                "https://github.com/Bowen0011/AT-Audio-Test-Analyzer\n\n"
+                "下载 at_analyzer.py 即可"
+            )
+            return
+
         srv,ds=self.server.get(),self.date.get(); data_root=os.path.join(srv,ds)
         if not os.path.exists(data_root):
             try:
