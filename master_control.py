@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-产线数据采集主控面板 v1.0
+产线数据采集主控面板 v2.0
 =======================
-部署于办公电脑，统一管理多产线多站别的数据采集触发与自动分析。
+一目了然：配置 → 采集 → 看报告
 
-工作流：
-  1. 配置服务器路径 + 各线体/站别
-  2. 点击「开始采集」→ 向服务器写 trigger JSON
-  3. 轮询各机台完成标记
-  4. 全部到齐 → 自动跑 AT Analyzer 直读网络路径 → 弹出报告
+Tab 1: 站别管理（表格直管，不用右键菜单）
+Tab 2: 采集监控（一键触发，实时状态）
+Tab 3: 历史报告
 """
 import os
 import sys
@@ -19,967 +17,660 @@ import time
 import subprocess
 import configparser
 import datetime
-from pathlib import Path
 from tkinter import ttk, filedialog, messagebox
 import tkinter as tk
 
-# ═══════════════════════════════════════════════
-# 常量
-# ═══════════════════════════════════════════════
-POLL_INTERVAL = 3  # 轮询完成标记间隔(秒)
-TRIGGER_FILENAME = "{station}_cmd.json"
-DONE_FILENAME = "{station}_done.json"
-
 STYLE = {
-    "bg": "#f0f2f5",
-    "fg": "#1a1a2e",
-    "card_bg": "#ffffff",
+    "bg": "#f5f6fa",
+    "card": "#ffffff",
     "accent": "#2563EB",
-    "accent_hover": "#1D4ED8",
-    "success": "#16A34A",
-    "danger": "#DC2626",
+    "success": "#10B981",
+    "danger": "#EF4444",
     "warning": "#F59E0B",
-    "text_secondary": "#6B7280",
-    "input_bg": "#ffffff",
+    "text": "#1e293b",
+    "sub": "#64748b",
+    "border": "#e2e8f0",
 }
 
+POLL_INTERVAL = 3
+TIMEOUT = 600
+
 
 # ═══════════════════════════════════════════════
-# 核心逻辑
+# 核心引擎（同 v1.0）
 # ═══════════════════════════════════════════════
 class TriggerManager:
-    """管理服务器端 trigger 文件的读写与轮询"""
-
     def __init__(self, server_root):
-        self.server_root = server_root
-        self.trigger_dir = os.path.join(server_root, "trigger")
+        self.root = server_root
+        self.dir = os.path.join(server_root, "trigger")
 
-    def ensure_trigger_dir(self):
-        os.makedirs(self.trigger_dir, exist_ok=True)
+    def cmd_path(self, line, st):
+        d = os.path.join(self.dir, f"line_{line}")
+        os.makedirs(d, exist_ok=True)
+        return os.path.join(d, f"{st}_cmd.json")
 
-    def get_trigger_path(self, line_id, station_type):
-        """trigger/{line_id}/{station}_cmd.json"""
-        line_dir = os.path.join(self.trigger_dir, f"line_{line_id}")
-        os.makedirs(line_dir, exist_ok=True)
-        return os.path.join(line_dir, TRIGGER_FILENAME.format(station=station_type))
+    def done_path(self, line, st):
+        return os.path.join(self.dir, f"line_{line}", f"{st}_done.json")
 
-    def get_done_path(self, line_id, station_type):
-        """trigger/{line_id}/{station}_done.json"""
-        line_dir = os.path.join(self.trigger_dir, f"line_{line_id}")
-        return os.path.join(line_dir, DONE_FILENAME.format(station=station_type))
-
-    def write_trigger(self, line_id, station_type, config):
-        """向服务器写入一条 trigger 指令"""
+    def write(self, line, st, target_root, src_dirs):
         cmd = {
             "action": "sync_now",
             "timestamp": datetime.datetime.now().isoformat(),
-            "line": line_id,
-            "station_type": station_type,
-            "target_root": config.get("target_root", ""),
-            "source_paths": config.get("source_paths", []),
+            "line": line, "station_type": st,
+            "target_root": target_root,
+            "source_paths": [{"src": d, "dst_sub": os.path.basename(d.rstrip("/\\")) or "data"} for d in src_dirs],
         }
-        path = self.get_trigger_path(line_id, station_type)
-        with open(path, "w", encoding="utf-8") as f:
+        p = self.cmd_path(line, st)
+        with open(p, "w", encoding="utf-8") as f:
             json.dump(cmd, f, ensure_ascii=False, indent=2)
-        return path
+        return p
 
-    def write_all_triggers(self, lines_config, log_cb=None):
-        """批量写入所有线体/站别的 trigger"""
-        written = []
-        for line_id, stations in lines_config.items():
-            for st_type, st_config in stations.items():
-                if st_config.get("enabled", True):
-                    path = self.write_trigger(line_id, st_type, st_config)
-                    written.append((line_id, st_type, path))
-                    if log_cb:
-                        log_cb(f"📤 trigger → line_{line_id}/{st_type}")
-        return written
-
-    def check_done(self, line_id, station_type):
-        """检查某个站别是否完成"""
-        path = self.get_done_path(line_id, station_type)
-        if not os.path.exists(path):
+    def check(self, line, st):
+        p = self.done_path(line, st)
+        if not os.path.exists(p):
             return None
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(p, encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, OSError):
+        except:
             return None
 
-    def clear_trigger(self, line_id, station_type):
-        """清理已消费的 trigger 文件"""
-        path = self.get_trigger_path(line_id, station_type)
-        if os.path.exists(path):
-            os.remove(path)
 
-    def clear_done(self, line_id, station_type):
-        path = self.get_done_path(line_id, station_type)
-        if os.path.exists(path):
-            os.remove(path)
-
-    def build_source_paths(self, station_config, target_root):
-        """根据站别配置构建数据路径映射"""
-        paths = []
-        for src_dir in station_config.get("source_dirs", []):
-            # src_dir 格式: D:/TestLog/AT01/TC661
-            if src_dir:
-                basename = os.path.basename(src_dir.rstrip("/\\"))
-                if not basename:
-                    basename = os.path.basename(os.path.dirname(src_dir.rstrip("/\\")))
-                paths.append({"src": src_dir, "dst_sub": basename})
-        return paths
-
-
-# ═══════════════════════════════════════════════
-# Analyzer 桥接
-# ═══════════════════════════════════════════════
 class AnalyzerBridge:
-    """对接 AT-Audio-Test-Analyzer，支持导入模块或子进程调用"""
-
     @staticmethod
-    def run_analysis(data_path, output_dir, log_cb=None):
-        """
-        对指定数据目录运行分析。
-        先尝试导入 at_analyzer 模块（同目录），失败则走子进程。
-        """
+    def run(data_path, out_dir, log_cb):
         try:
-            # 尝试导入 at_analyzer 模块
             sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
             import at_analyzer
-
-            if log_cb:
-                log_cb("🔍 开始解析数据...")
-
-            recs, skipped, st_files = at_analyzer.parse_source(data_path)
+            log_cb("🔍 解析数据中...")
+            recs, skipped, sf = at_analyzer.parse_source(data_path)
             if not recs:
-                raise ValueError("未找到有效测试记录")
-
-            if log_cb:
-                log_cb(f"📊 解析完成：{len(recs)} 行记录")
-
-            analysis = at_analyzer.analyze(recs)
-            os.makedirs(output_dir, exist_ok=True)
-
-            html_path = at_analyzer.make_html(
-                analysis, output_dir,
-                os.path.join(output_dir, "report.html"),
-                os.path.basename(data_path)
-            )
-
-            if log_cb:
-                log_cb(f"✅ 报告已生成：{html_path}")
-
-            return html_path, analysis
-
+                raise ValueError("未找到有效记录")
+            log_cb(f"📊 {len(recs)} 行记录，{len(sf)} 个站别")
+            a = at_analyzer.analyze(recs)
+            os.makedirs(out_dir, exist_ok=True)
+            hp = at_analyzer.make_html(a, out_dir, os.path.join(out_dir, "report.html"), os.path.basename(data_path))
+            log_cb(f"✅ 报告: {hp}")
+            return hp, a
         except ImportError:
-            # 子进程方式调用
-            if log_cb:
-                log_cb("⚠️ 未找到本地 at_analyzer.py，尝试子进程调用...")
-
-            analyzer_script = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "..", "AT-Audio-Test-Analyzer", "at_analyzer.py"
-            )
-
-            # 用 -c 让 Python 直接执行内联代码来调用分析
+            log_cb("⚠️ 未找到 at_analyzer.py，尝试子进程...")
+            # fallback
+            analyzer = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "AT-Audio-Test-Analyzer", "at_analyzer.py")
             code = f'''
-import sys; sys.path.insert(0, r"{os.path.dirname(analyzer_script)}")
-import at_analyzer
-recs, skipped, st_files = at_analyzer.parse_source(r"{data_path}")
-analysis = at_analyzer.analyze(recs)
-html = at_analyzer.make_html(analysis, r"{output_dir}", r"{os.path.join(output_dir, 'report.html')}", r"{os.path.basename(data_path)}")
-print("OK:" + html)
+import sys; sys.path.insert(0, r"{os.path.dirname(analyzer)}")
+import at_analyzer as aa
+r,sk,sf = aa.parse_source(r"{data_path}")
+a = aa.analyze(r)
+hp = aa.make_html(a, r"{out_dir}", r"{os.path.join(out_dir, 'report.html')}", r"{os.path.basename(data_path)}")
+print("OK:"+hp)
 '''
-            result = subprocess.run(
-                [sys.executable, "-c", code],
-                capture_output=True, text=True, timeout=300
-            )
+            result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=300)
             if result.returncode == 0 and "OK:" in result.stdout:
-                html_path = result.stdout.split("OK:")[1].strip()
-                return html_path, None
-            else:
-                raise RuntimeError(f"Analyzer 子进程失败:\n{result.stderr}")
+                return result.stdout.split("OK:")[1].strip(), None
+            raise RuntimeError(result.stderr)
 
 
 # ═══════════════════════════════════════════════
-# GUI 主控面板
+# GUI v2.0 — 一目了然
 # ═══════════════════════════════════════════════
-class MasterControlApp:
+class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("产线数据采集主控面板 v1.0")
-        self.root.geometry("900x700")
-        self.root.minsize(800, 550)
-        self.root.configure(bg=STYLE["bg"])
+        root.title("产线数据采集主控 v2.0")
+        root.geometry("1000x720")
+        root.minsize(900, 600)
+        root.configure(bg=STYLE["bg"])
 
-        # DPI 感知
         try:
             from ctypes import windll
             windll.shcore.SetProcessDpiAwareness(1)
-        except Exception:
+        except:
             pass
 
-        # 配置
-        app_path = os.path.dirname(
-            sys.executable if getattr(sys, 'frozen', False)
-            else os.path.abspath(__file__)
-        )
-        self.config_file = os.path.join(app_path, "config.ini")
-        self.config = configparser.ConfigParser()
-        self.server_root = tk.StringVar(value="")
-        self.date_var = tk.StringVar(value=datetime.date.today().isoformat())
-        self.status_var = tk.StringVar(value="就绪 — 配置服务器路径后开始")
-        self.progress_var = tk.DoubleVar(value=0)
+        app_dir = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
+        self.cfg_file = os.path.join(app_dir, "config.ini")
+        self.cfg = configparser.ConfigParser()
 
-        # 线体/站别树形数据
-        # {line_id: {station_type: {"enabled": True, "source_dirs": [...], "target_root": "..."}}}
-        self.lines = {}
+        # 数据
+        self.server = tk.StringVar()
+        self.date = tk.StringVar(value=datetime.date.today().isoformat())
+        self.stations = []  # [{line, station, dirs:[...], enabled:bool}]
 
-        # 运行状态
+        # 运行时
         self.monitoring = False
-        self.monitor_thread = None
-        self.pending_stations = []  # [(line_id, station_type), ...]
-        self.station_status = {}    # {(line_id, station_type): "waiting"|"running"|"done"|"error"}
+        self.pending = []
+        self.status = {}  # (line,st) → waiting/running/done/error
+        self.last_report = None
 
-        self.load_config()
-        self._build_ui()
+        self.load_cfg()
+        self._build()
+        self._refresh_table()
 
-    # ═══════════════════════════════════════════
-    # 配置持久化
-    # ═══════════════════════════════════════════
-    def load_config(self):
-        if os.path.exists(self.config_file):
-            self.config.read(self.config_file, encoding="utf-8")
-            self.server_root.set(
-                self.config.get("SERVER", "root", fallback="")
-            )
-            self.date_var.set(
-                self.config.get("SERVER", "date", fallback=datetime.date.today().isoformat())
-            )
-            # 加载线体配置
-            for section in self.config.sections():
-                if section.startswith("LINE_"):
-                    line_id = section[5:]
-                    stations_str = self.config.get(section, "stations", fallback="")
-                    if stations_str:
-                        self.lines[line_id] = {}
-                        for st_info in stations_str.split(";"):
-                            parts = st_info.split(":")
-                            if len(parts) >= 2:
-                                st_type = parts[0]
-                                enabled = parts[1] == "1" if len(parts) > 1 else True
-                                source_dirs = parts[2].split(",") if len(parts) > 2 and parts[2] else []
-                                self.lines[line_id][st_type] = {
-                                    "enabled": enabled,
-                                    "source_dirs": [d for d in source_dirs if d],
-                                    "target_root": self.server_root.get(),
-                                }
+    # ═══ 配置 ═══
+    def load_cfg(self):
+        if os.path.exists(self.cfg_file):
+            self.cfg.read(self.cfg_file, encoding="utf-8")
+            self.server.set(self.cfg.get("SERVER", "root", fallback=""))
+            self.date.set(self.cfg.get("SERVER", "date", fallback=datetime.date.today().isoformat()))
+            for s in self.cfg.sections():
+                if s.startswith("STATION_"):
+                    self.stations.append({
+                        "line": self.cfg.get(s, "line", fallback=""),
+                        "station": self.cfg.get(s, "station", fallback=""),
+                        "dirs": json.loads(self.cfg.get(s, "dirs", fallback="[]")),
+                        "enabled": self.cfg.getboolean(s, "enabled", fallback=True),
+                    })
 
-    def save_config(self):
-        if "SERVER" not in self.config:
-            self.config["SERVER"] = {}
-        self.config["SERVER"]["root"] = self.server_root.get()
-        self.config["SERVER"]["date"] = self.date_var.get()
-
-        for line_id, stations in self.lines.items():
-            section = f"LINE_{line_id}"
-            if section not in self.config:
-                self.config[section] = {}
-            parts = []
-            for st_type, st_cfg in stations.items():
-                dirs = ",".join(st_cfg.get("source_dirs", []))
-                enabled = "1" if st_cfg.get("enabled", True) else "0"
-                parts.append(f"{st_type}:{enabled}:{dirs}")
-            self.config[section]["stations"] = ";".join(parts)
-
-        with open(self.config_file, "w", encoding="utf-8") as f:
-            self.config.write(f)
-
-    # ═══════════════════════════════════════════
-    # UI 构建
-    # ═══════════════════════════════════════════
-    def _build_ui(self):
-        # Header
-        hdr = tk.Frame(self.root, bg=STYLE["accent"], height=48)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        tk.Label(
-            hdr, text="🏭 产线数据采集主控", bg=STYLE["accent"],
-            fg="white", font=("Microsoft YaHei", 15, "bold")
-        ).pack(side="left", padx=20, pady=10)
-
-        main = tk.Frame(self.root, bg=STYLE["bg"])
-        main.pack(fill="both", expand=True, padx=15, pady=(10, 0))
-
-        # ── 左栏：配置 ──
-        left = tk.Frame(main, bg=STYLE["bg"])
-        left.pack(side="left", fill="y", padx=(0, 10))
-
-        # 服务器路径
-        f1 = tk.LabelFrame(
-            left, text="🖥 服务器路径", bg=STYLE["card_bg"],
-            fg=STYLE["fg"], font=("Microsoft YaHei", 11, "bold"),
-            padx=12, pady=10
-        )
-        f1.pack(fill="x", pady=(0, 8))
-        r1 = tk.Frame(f1, bg=STYLE["card_bg"])
-        r1.pack(fill="x")
-        tk.Entry(
-            r1, textvariable=self.server_root, font=("Consolas", 10),
-            bg=STYLE["input_bg"], relief="solid", bd=1
-        ).pack(side="left", fill="x", expand=True, ipady=3)
-        tk.Button(
-            r1, text="📂 浏览", command=self._pick_server,
-            bg=STYLE["accent"], fg="white", font=("Microsoft YaHei", 9),
-            relief="flat", padx=12, pady=3, cursor="hand2"
-        ).pack(side="left", padx=(6, 0))
-
-        # 日期
-        r_date = tk.Frame(f1, bg=STYLE["card_bg"])
-        r_date.pack(fill="x", pady=(8, 0))
-        tk.Label(
-            r_date, text="采集日期:", bg=STYLE["card_bg"],
-            fg=STYLE["text_secondary"], font=("Microsoft YaHei", 10)
-        ).pack(side="left")
-        tk.Entry(
-            r_date, textvariable=self.date_var, width=14,
-            font=("Consolas", 10), bg=STYLE["input_bg"],
-            relief="solid", bd=1
-        ).pack(side="left", padx=(6, 0))
-        tk.Label(
-            r_date, text="(YYYY-MM-DD)", bg=STYLE["card_bg"],
-            fg=STYLE["text_secondary"], font=("Microsoft YaHei", 8)
-        ).pack(side="left", padx=(4, 0))
-
-        # 线体/站别管理
-        f2 = tk.LabelFrame(
-            left, text="🏗 线体 & 站别管理", bg=STYLE["card_bg"],
-            fg=STYLE["fg"], font=("Microsoft YaHei", 11, "bold"),
-            padx=12, pady=10
-        )
-        f2.pack(fill="both", expand=True, pady=(0, 8))
-
-        # 树形列表
-        tree_frame = tk.Frame(f2, bg=STYLE["card_bg"])
-        tree_frame.pack(fill="both", expand=True)
-        self.line_tree = ttk.Treeview(
-            tree_frame, columns=("info",), show="tree",
-            height=10, selectmode="browse"
-        )
-        self.line_tree.heading("#0", text="线体 / 站别")
-        self.line_tree.column("#0", width=200)
-        self.line_tree.pack(side="left", fill="both", expand=True)
-
-        scroll_y = ttk.Scrollbar(tree_frame, command=self.line_tree.yview)
-        scroll_y.pack(side="right", fill="y")
-        self.line_tree.config(yscrollcommand=scroll_y.set)
-
-        # 右键菜单
-        self.tree_menu = tk.Menu(self.line_tree, tearoff=0)
-        self.tree_menu.add_command(label="➕ 添加站别", command=self._add_station_dialog)
-        self.tree_menu.add_command(label="📂 设置源目录", command=self._edit_source_dirs)
-        self.tree_menu.add_command(label="✅/❌ 启用/禁用", command=self._toggle_station)
-        self.tree_menu.add_separator()
-        self.tree_menu.add_command(label="🗑 删除", command=self._delete_selected)
-        self.line_tree.bind("<Button-3>", self._show_tree_menu)
-
-        # 按钮行
-        btn_row = tk.Frame(f2, bg=STYLE["card_bg"])
-        btn_row.pack(fill="x", pady=(8, 0))
-        tk.Button(
-            btn_row, text="➕ 添加线体", command=self._add_line_dialog,
-            bg="#ECEFF1", fg=STYLE["fg"], font=("Microsoft YaHei", 9),
-            relief="flat", padx=10, pady=2, cursor="hand2"
-        ).pack(side="left", padx=(0, 6))
-
-        # 操作按钮
-        f3 = tk.Frame(left, bg=STYLE["bg"])
-        f3.pack(fill="x", pady=(0, 8))
-        self.start_btn = tk.Button(
-            f3, text="🚀 开始采集", command=self._start_collection,
-            bg=STYLE["accent"], fg="white",
-            font=("Microsoft YaHei", 12, "bold"),
-            relief="flat", padx=20, pady=10, cursor="hand2"
-        )
-        self.start_btn.pack(side="left", fill="x", expand=True)
-        self.stop_btn = tk.Button(
-            f3, text="⏹ 取消监控", command=self._stop_monitoring,
-            bg=STYLE["danger"], fg="white",
-            font=("Microsoft YaHei", 10),
-            relief="flat", padx=12, pady=10, cursor="hand2",
-            state="disabled"
-        )
-        self.stop_btn.pack(side="left", padx=(6, 0))
-
-        # ── 右栏：状态 & 日志 ──
-        right = tk.Frame(main, bg=STYLE["bg"])
-        right.pack(side="left", fill="both", expand=True)
-
-        # 状态面板
-        status_frame = tk.LabelFrame(
-            right, text="📊 采集状态", bg=STYLE["card_bg"],
-            fg=STYLE["fg"], font=("Microsoft YaHei", 11, "bold"),
-            padx=12, pady=10
-        )
-        status_frame.pack(fill="both", expand=True, pady=(0, 8))
-
-        self.status_tree = ttk.Treeview(
-            status_frame,
-            columns=("line", "station", "status", "detail"),
-            show="headings", height=12
-        )
-        self.status_tree.heading("line", text="线体")
-        self.status_tree.column("line", width=80, anchor="center")
-        self.status_tree.heading("station", text="站别")
-        self.status_tree.column("station", width=60, anchor="center")
-        self.status_tree.heading("status", text="状态")
-        self.status_tree.column("status", width=100, anchor="center")
-        self.status_tree.heading("detail", text="详情")
-        self.status_tree.column("detail", width=200)
-        self.status_tree.pack(fill="both", expand=True)
-
-        # 日志
-        log_frame = tk.LabelFrame(
-            right, text="📋 运行日志", bg=STYLE["card_bg"],
-            fg=STYLE["fg"], font=("Microsoft YaHei", 11, "bold"),
-            padx=12, pady=10
-        )
-        log_frame.pack(fill="x", pady=(0, 8))
-        self.log_text = tk.Text(
-            log_frame, height=8, bg="#1a1a2e", fg="#e2e8f0",
-            font=("Consolas", 9), relief="flat", bd=0,
-            insertbackground="white", state="disabled"
-        )
-        self.log_text.pack(fill="both", expand=True)
-
-        # 底部状态栏
-        sbar = tk.Frame(self.root, bg=STYLE["card_bg"], height=28)
-        sbar.pack(fill="x", side="bottom", pady=(8, 0))
-        sbar.pack_propagate(False)
-        tk.Label(
-            sbar, textvariable=self.status_var, bg=STYLE["card_bg"],
-            fg=STYLE["text_secondary"], font=("Microsoft YaHei", 9),
-            anchor="w"
-        ).pack(side="left", fill="x", padx=12, pady=3)
-        self.pb = ttk.Progressbar(
-            sbar, variable=self.progress_var, mode="determinate", length=150
-        )
-        self.pb.pack(side="right", padx=12, pady=2)
-
-        # 刷新树
-        self._refresh_line_tree()
-
-    # ═══════════════════════════════════════════
-    # 线体/站别树管理
-    # ═══════════════════════════════════════════
-    def _refresh_line_tree(self):
-        for item in self.line_tree.get_children():
-            self.line_tree.delete(item)
-
-        for line_id in sorted(self.lines.keys()):
-            stations = self.lines[line_id]
-            line_node = self.line_tree.insert(
-                "", "end", iid=f"L_{line_id}",
-                text=f"📁 {line_id}",
-                values=(f"{len(stations)} 个站别",)
-            )
-            for st_type in sorted(stations.keys()):
-                st_cfg = stations[st_type]
-                enabled = st_cfg.get("enabled", True)
-                icon = "✅" if enabled else "❌"
-                dirs = st_cfg.get("source_dirs", [])
-                info = f"{len(dirs)} 个源目录" if dirs else "未配置源目录"
-                self.line_tree.insert(
-                    line_node, "end", iid=f"S_{line_id}_{st_type}",
-                    text=f"{icon} {st_type}",
-                    values=(info,)
-                )
-
-    def _show_tree_menu(self, event):
-        item = self.line_tree.identify_row(event.y)
-        if item:
-            self.line_tree.selection_set(item)
-            self.tree_menu.post(event.x_root, event.y_root)
-
-    def _get_selected(self):
-        sel = self.line_tree.selection()
-        if not sel:
-            return None, None
-        iid = sel[0]
-        if iid.startswith("S_"):
-            # 站别节点: S_{line_id}_{station_type}
-            parts = iid[2:].split("_", 1)
-            return parts[0], parts[1]
-        elif iid.startswith("L_"):
-            # 线体节点
-            return iid[2:], None
-        return None, None
-
-    def _add_line_dialog(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("添加线体")
-        dialog.geometry("300x120")
-        dialog.configure(bg=STYLE["card_bg"])
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(
-            dialog, text="线体编号:", bg=STYLE["card_bg"],
-            font=("Microsoft YaHei", 11)
-        ).pack(pady=(15, 5))
-        entry = tk.Entry(dialog, font=("Consolas", 12), width=20)
-        entry.pack(pady=(0, 10))
-        entry.focus()
-
-        def confirm():
-            line_id = entry.get().strip()
-            if not line_id:
-                messagebox.showwarning("提示", "请输入线体编号")
-                return
-            if line_id in self.lines:
-                messagebox.showwarning("提示", f"线体 {line_id} 已存在")
-                return
-            self.lines[line_id] = {}
-            self._refresh_line_tree()
-            self.save_config()
-            dialog.destroy()
-
-        entry.bind("<Return>", lambda e: confirm())
-        tk.Button(
-            dialog, text="确认", command=confirm,
-            bg=STYLE["accent"], fg="white",
-            font=("Microsoft YaHei", 10), relief="flat",
-            padx=20, pady=5
-        ).pack()
-
-    def _add_station_dialog(self):
-        line_id, _ = self._get_selected()
-        if not line_id:
-            # 可能是站别节点，往上找线体
-            sel = self.line_tree.selection()
-            if sel:
-                parent = self.line_tree.parent(sel[0])
-                if parent:
-                    line_id = parent[2:]
-        if not line_id:
-            messagebox.showwarning("提示", "请先选择一个线体节点")
-            return
-        if line_id not in self.lines:
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("添加站别")
-        dialog.geometry("300x120")
-        dialog.configure(bg=STYLE["card_bg"])
-        dialog.transient(self.root)
-        dialog.grab_set()
-
-        tk.Label(
-            dialog, text=f"线体 {line_id} — 站别类型:",
-            bg=STYLE["card_bg"], font=("Microsoft YaHei", 11)
-        ).pack(pady=(15, 5))
-        entry = tk.Entry(dialog, font=("Consolas", 12), width=20)
-        entry.pack(pady=(0, 10))
-        entry.focus()
-
-        def confirm():
-            st_type = entry.get().strip()
-            if not st_type:
-                return
-            if st_type in self.lines[line_id]:
-                messagebox.showwarning("提示", f"站别 {st_type} 已存在")
-                return
-            self.lines[line_id][st_type] = {
-                "enabled": True,
-                "source_dirs": [],
-                "target_root": self.server_root.get(),
+    def save_cfg(self):
+        if "SERVER" not in self.cfg:
+            self.cfg["SERVER"] = {}
+        self.cfg["SERVER"]["root"] = self.server.get()
+        self.cfg["SERVER"]["date"] = self.date.get()
+        # 清旧配置
+        for s in list(self.cfg.sections()):
+            if s.startswith("STATION_"):
+                self.cfg.remove_section(s)
+        for i, st in enumerate(self.stations):
+            sec = f"STATION_{i}"
+            self.cfg[sec] = {
+                "line": st["line"],
+                "station": st["station"],
+                "dirs": json.dumps(st.get("dirs", []), ensure_ascii=False),
+                "enabled": str(st.get("enabled", True)),
             }
-            self._refresh_line_tree()
-            self.save_config()
-            dialog.destroy()
+        with open(self.cfg_file, "w", encoding="utf-8") as f:
+            self.cfg.write(f)
 
-        entry.bind("<Return>", lambda e: confirm())
-        tk.Button(
-            dialog, text="确认", command=confirm,
-            bg=STYLE["accent"], fg="white",
-            font=("Microsoft YaHei", 10), relief="flat",
-            padx=20, pady=5
-        ).pack()
+    # ═══ UI ═══
+    def _build(self):
+        # ── 顶部栏 ──
+        top = tk.Frame(self.root, bg=STYLE["accent"], height=52)
+        top.pack(fill="x")
+        top.pack_propagate(False)
+        tk.Label(top, text="🏭 产线数据采集主控 v2.0", bg=STYLE["accent"], fg="white",
+                 font=("Microsoft YaHei", 16, "bold")).pack(side="left", padx=20, pady=12)
+        tk.Label(top, text="配置 → 采集 → 看报告", bg=STYLE["accent"], fg="#93C5FD",
+                 font=("Microsoft YaHei", 10)).pack(side="right", padx=20, pady=12)
 
-    def _edit_source_dirs(self):
-        line_id, st_type = self._get_selected()
-        if not line_id or not st_type or line_id not in self.lines:
-            messagebox.showwarning("提示", "请选择一个站别节点")
+        # ── 服务器行 ──
+        bar = tk.Frame(self.root, bg=STYLE["card"], height=48)
+        bar.pack(fill="x", padx=12, pady=(10, 0))
+        bar.pack_propagate(False)
+
+        tk.Label(bar, text="📡 服务器", bg=STYLE["card"], fg=STYLE["text"],
+                 font=("Microsoft YaHei", 11, "bold")).pack(side="left", padx=(12, 6), pady=12)
+        tk.Entry(bar, textvariable=self.server, font=("Consolas", 10), width=45,
+                 bg="#f8fafc", relief="solid", bd=1).pack(side="left", ipady=2, pady=8)
+        tk.Button(bar, text="浏览", command=lambda: self._browse(self.server),
+                  bg=STYLE["accent"], fg="white", font=("Microsoft YaHei", 9),
+                  relief="flat", padx=14, cursor="hand2").pack(side="left", padx=6)
+
+        ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=10, pady=8)
+
+        tk.Label(bar, text="📅 日期", bg=STYLE["card"], fg=STYLE["text"],
+                 font=("Microsoft YaHei", 11, "bold")).pack(side="left", padx=(6, 4), pady=12)
+        tk.Entry(bar, textvariable=self.date, font=("Consolas", 11), width=12,
+                 bg="#f8fafc", relief="solid", bd=1).pack(side="left", ipady=2, pady=8)
+        tk.Button(bar, text="今天", command=lambda: self.date.set(datetime.date.today().isoformat()),
+                  bg="#e2e8f0", fg=STYLE["text"], font=("Microsoft YaHei", 9),
+                  relief="flat", padx=8, cursor="hand2").pack(side="left", padx=4)
+
+        # ── 主 Notebook ──
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True, padx=12, pady=8)
+
+        # === Tab 1: 站别管理 ===
+        t1 = tk.Frame(nb, bg=STYLE["bg"])
+        nb.add(t1, text="  ⚙️ 站别管理  ")
+
+        # 添加行
+        add_bar = tk.Frame(t1, bg=STYLE["card"])
+        add_bar.pack(fill="x", pady=(0, 8))
+        tk.Label(add_bar, text="  线体:", bg=STYLE["card"], font=("Microsoft YaHei", 10)).pack(side="left", pady=8)
+        self.add_line = ttk.Combobox(add_bar, values=["A03", "A05", "A07", "Line_1", "Line_2"], width=8, font=("Consolas", 10))
+        self.add_line.pack(side="left", padx=(4, 12), pady=8)
+        self.add_line.set("A03")
+        tk.Label(add_bar, text="站别:", bg=STYLE["card"], font=("Microsoft YaHei", 10)).pack(side="left", pady=8)
+        self.add_st = ttk.Combobox(add_bar, values=["AT", "FT", "QA"], width=6, font=("Consolas", 10))
+        self.add_st.pack(side="left", padx=4, pady=8)
+        self.add_st.set("AT")
+        tk.Button(add_bar, text="➕ 添加", command=self._add_station,
+                  bg=STYLE["accent"], fg="white", font=("Microsoft YaHei", 10),
+                  relief="flat", padx=14, cursor="hand2").pack(side="left", padx=10, pady=6)
+
+        # 表格
+        tbl_frame = tk.Frame(t1, bg=STYLE["card"])
+        tbl_frame.pack(fill="both", expand=True)
+
+        cols = ("#", "线体", "站别", "数据源目录", "启用", "")
+        self.tbl = ttk.Treeview(tbl_frame, columns=cols, show="headings", height=14)
+        self.tbl.heading("#", text="#"); self.tbl.column("#", width=35, anchor="center")
+        self.tbl.heading("线体", text="线体"); self.tbl.column("线体", width=70, anchor="center")
+        self.tbl.heading("站别", text="站别"); self.tbl.column("站别", width=60, anchor="center")
+        self.tbl.heading("数据源目录", text="数据源目录"); self.tbl.column("数据源目录", width=420)
+        self.tbl.heading("启用", text="启用"); self.tbl.column("启用", width=50, anchor="center")
+        self.tbl.heading("", text=""); self.tbl.column("", width=160)
+        self.tbl.pack(side="left", fill="both", expand=True)
+
+        sb = ttk.Scrollbar(tbl_frame, command=self.tbl.yview)
+        sb.pack(side="right", fill="y")
+        self.tbl.config(yscrollcommand=sb.set)
+
+        # 表格内按钮绑定
+        self.tbl.bind("<Button-1>", self._tbl_click)
+        self.tbl.tag_configure("on", foreground=STYLE["success"])
+        self.tbl.tag_configure("off", foreground=STYLE["sub"])
+
+        # === Tab 2: 采集监控 ===
+        t2 = tk.Frame(nb, bg=STYLE["bg"])
+        nb.add(t2, text="  🚀 采集监控  ")
+
+        # 大按钮
+        btn_row = tk.Frame(t2, bg=STYLE["bg"])
+        btn_row.pack(fill="x", pady=(8, 12))
+        self.go_btn = tk.Button(btn_row, text="🚀 开始采集全部站别", command=self._start,
+                                 bg=STYLE["accent"], fg="white",
+                                 font=("Microsoft YaHei", 14, "bold"),
+                                 relief="flat", padx=30, pady=14, cursor="hand2")
+        self.go_btn.pack(fill="x", ipady=4)
+
+        # 进度条
+        self.prog = ttk.Progressbar(t2, mode="determinate", length=600)
+        self.prog.pack(fill="x")
+
+        self.prog_label = tk.Label(t2, text="就绪", bg=STYLE["bg"], fg=STYLE["sub"],
+                                    font=("Microsoft YaHei", 10))
+        self.prog_label.pack(pady=(4, 8))
+
+        # 状态表
+        st_frame = tk.Frame(t2, bg=STYLE["card"])
+        st_frame.pack(fill="both", expand=True)
+
+        scols = ("线体", "站别", "状态", "详情")
+        self.st_tbl = ttk.Treeview(st_frame, columns=scols, show="headings", height=10)
+        self.st_tbl.heading("线体", text="线体"); self.st_tbl.column("线体", width=80, anchor="center")
+        self.st_tbl.heading("站别", text="站别"); self.st_tbl.column("站别", width=80, anchor="center")
+        self.st_tbl.heading("状态", text="状态"); self.st_tbl.column("状态", width=120, anchor="center")
+        self.st_tbl.heading("详情", text="详情"); self.st_tbl.column("详情", width=350)
+        self.st_tbl.pack(side="left", fill="both", expand=True)
+
+        ssb = ttk.Scrollbar(st_frame, command=self.st_tbl.yview)
+        ssb.pack(side="right", fill="y")
+        self.st_tbl.config(yscrollcommand=ssb.set)
+
+        self.st_tbl.tag_configure("ok", foreground=STYLE["success"])
+        self.st_tbl.tag_configure("err", foreground=STYLE["danger"])
+        self.st_tbl.tag_configure("wait", foreground=STYLE["warning"])
+
+        # 打开报告按钮
+        self.rpt_btn = tk.Button(t2, text="📄 打开最新报告", command=self._open_report,
+                                  bg=STYLE["success"], fg="white",
+                                  font=("Microsoft YaHei", 11, "bold"),
+                                  relief="flat", padx=20, pady=10, cursor="hand2",
+                                  state="disabled")
+        self.rpt_btn.pack(side="left", pady=(10, 0), padx=(0, 6))
+
+        self.rpt_dir_btn = tk.Button(t2, text="📂 打开输出目录", command=self._open_outdir,
+                                      bg="#e2e8f0", fg=STYLE["text"],
+                                      font=("Microsoft YaHei", 10),
+                                      relief="flat", padx=16, pady=10, cursor="hand2",
+                                      state="disabled")
+        self.rpt_dir_btn.pack(side="left", pady=(10, 0))
+
+        # === Tab 3: 日志 ===
+        t3 = tk.Frame(nb, bg=STYLE["bg"])
+        nb.add(t3, text="  📋 日志  ")
+
+        log_top = tk.Frame(t3, bg=STYLE["bg"])
+        log_top.pack(fill="x", pady=(0, 4))
+        tk.Button(log_top, text="清空日志", command=self._clear_log,
+                  bg="#e2e8f0", fg=STYLE["text"], font=("Microsoft YaHei", 9),
+                  relief="flat", padx=10, cursor="hand2").pack(side="right")
+
+        self.log = tk.Text(t3, bg="#1e293b", fg="#e2e8f0", insertbackground="white",
+                           font=("Consolas", 9), relief="flat", bd=0, state="disabled")
+        self.log.pack(fill="both", expand=True)
+
+        # 状态栏
+        sbar = tk.Frame(self.root, bg=STYLE["card"], height=26)
+        sbar.pack(fill="x", side="bottom")
+        sbar.pack_propagate(False)
+        self.sbar_text = tk.Label(sbar, text="就绪 — 请先配置服务器路径和站别",
+                                   bg=STYLE["card"], fg=STYLE["sub"],
+                                   font=("Microsoft YaHei", 9), anchor="w")
+        self.sbar_text.pack(side="left", fill="x", padx=12, pady=3)
+
+    # ═══ 站别管理 ═══
+    def _refresh_table(self):
+        for i in self.tbl.get_children():
+            self.tbl.delete(i)
+        for idx, st in enumerate(self.stations, 1):
+            dirs_text = "  |  ".join(st.get("dirs", [])) if st.get("dirs") else "（未配置 — 点击编辑）"
+            en = "✅" if st.get("enabled", True) else "❌"
+            tag = "on" if st.get("enabled", True) else "off"
+            iid = self.tbl.insert("", "end",
+                                   values=(idx, st["line"], st["station"], dirs_text, en, "📂编辑目录  🔄切换  🗑删除"),
+                                   tags=(tag,))
+            self.tbl.item(iid, tags=(tag,))
+
+    def _add_station(self):
+        line = self.add_line.get().strip()
+        st = self.add_st.get().strip()
+        if not line or not st:
             return
-        if st_type not in self.lines[line_id]:
+        for s in self.stations:
+            if s["line"] == line and s["station"] == st:
+                messagebox.showwarning("重复", f"{line}/{st} 已存在")
+                return
+        self.stations.append({"line": line, "station": st, "dirs": [], "enabled": True})
+        self._refresh_table()
+        self.save_cfg()
+        self._sbar(f"已添加 {line}/{st}")
+
+    def _tbl_click(self, event):
+        item = self.tbl.identify_row(event.y)
+        col = self.tbl.identify_column(event.x)
+        if not item:
+            return
+        idx = int(self.tbl.index(item))
+        if idx >= len(self.stations):
             return
 
-        st_cfg = self.lines[line_id][st_type]
+        col_idx = int(col.replace("#", "")) - 1
+        if col_idx == 5:  # 操作列
+            # 判断点击位置
+            x = event.x
+            # 粗略判断：📂编辑目录(0-80) 🔄切换(80-140) 🗑删除(140-)
+            st = self.stations[idx]
+            if x < 90:
+                self._edit_dirs(idx)
+            elif x < 155:
+                st["enabled"] = not st.get("enabled", True)
+                self._refresh_table()
+                self.save_cfg()
+            else:
+                if messagebox.askyesno("确认", f"删除 {st['line']}/{st['station']}？"):
+                    del self.stations[idx]
+                    self._refresh_table()
+                    self.save_cfg()
 
-        dialog = tk.Toplevel(self.root)
-        dialog.title(f"源目录配置 — {line_id}/{st_type}")
-        dialog.geometry("550x350")
-        dialog.configure(bg=STYLE["card_bg"])
-        dialog.transient(self.root)
-        dialog.grab_set()
+    def _edit_dirs(self, idx):
+        st = self.stations[idx]
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"数据源目录 — {st['line']}/{st['station']}")
+        dlg.geometry("600x380")
+        dlg.configure(bg=STYLE["card"])
+        dlg.transient(self.root)
+        dlg.grab_set()
 
-        tk.Label(
-            dialog, text=f"站别 {line_id}/{st_type} 的数据源目录",
-            bg=STYLE["card_bg"], font=("Microsoft YaHei", 11, "bold")
-        ).pack(pady=(10, 5))
+        tk.Label(dlg, text=f"{st['line']} 线 — {st['station']} 站",
+                 bg=STYLE["card"], font=("Microsoft YaHei", 13, "bold"),
+                 fg=STYLE["text"]).pack(pady=(12, 2))
+        tk.Label(dlg, text="设置此站别需要采集的数据源目录（可添加多个）",
+                 bg=STYLE["card"], font=("Microsoft YaHei", 9),
+                 fg=STYLE["sub"]).pack(pady=(0, 8))
 
-        list_frame = tk.Frame(dialog, bg=STYLE["card_bg"])
-        list_frame.pack(fill="both", expand=True, padx=10)
+        lst_frame = tk.Frame(dlg, bg=STYLE["card"])
+        lst_frame.pack(fill="both", expand=True, padx=12)
 
-        dir_listbox = tk.Listbox(
-            list_frame, font=("Consolas", 9), selectmode=tk.EXTENDED
-        )
-        dir_listbox.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(list_frame, command=dir_listbox.yview)
-        scroll.pack(side="right", fill="y")
-        dir_listbox.config(yscrollcommand=scroll.set)
+        lb = tk.Listbox(lst_frame, font=("Consolas", 9), selectmode=tk.EXTENDED, bg="#f8fafc")
+        lb.pack(side="left", fill="both", expand=True)
+        sc = ttk.Scrollbar(lst_frame, command=lb.yview)
+        sc.pack(side="right", fill="y")
+        lb.config(yscrollcommand=sc.set)
 
-        for d in st_cfg.get("source_dirs", []):
-            dir_listbox.insert(tk.END, d)
+        for d in st.get("dirs", []):
+            lb.insert(tk.END, d)
 
-        def add_dir():
-            path = filedialog.askdirectory(title="选择测试数据源目录")
-            if path:
-                dir_listbox.insert(tk.END, path.replace("\\", "/"))
+        def add():
+            p = filedialog.askdirectory(title="选择数据源目录", mustexist=True)
+            if p:
+                lb.insert(tk.END, p.replace("\\", "/"))
 
-        def remove_dir():
-            for idx in reversed(dir_listbox.curselection()):
-                dir_listbox.delete(idx)
+        def remove():
+            for i in reversed(lb.curselection()):
+                lb.delete(i)
 
-        btn_row = tk.Frame(dialog, bg=STYLE["card_bg"])
-        btn_row.pack(pady=8)
-        tk.Button(
-            btn_row, text="➕ 添加目录", command=add_dir,
-            bg=STYLE["accent"], fg="white",
-            font=("Microsoft YaHei", 9), relief="flat", padx=8, pady=2
-        ).pack(side="left", padx=3)
-        tk.Button(
-            btn_row, text="🗑 删除选中", command=remove_dir,
-            bg=STYLE["danger"], fg="white",
-            font=("Microsoft YaHei", 9), relief="flat", padx=8, pady=2
-        ).pack(side="left", padx=3)
+        btn_f = tk.Frame(dlg, bg=STYLE["card"])
+        btn_f.pack(pady=8)
+        tk.Button(btn_f, text="➕ 添加", command=add,
+                  bg=STYLE["accent"], fg="white", font=("Microsoft YaHei", 10),
+                  relief="flat", padx=14, pady=4).pack(side="left", padx=3)
+        tk.Button(btn_f, text="🗑 删除选中", command=remove,
+                  bg=STYLE["danger"], fg="white", font=("Microsoft YaHei", 10),
+                  relief="flat", padx=14, pady=4).pack(side="left", padx=3)
 
-        def save_dirs():
-            dirs = [dir_listbox.get(i) for i in range(dir_listbox.size())]
-            st_cfg["source_dirs"] = dirs
-            self._refresh_line_tree()
-            self.save_config()
-            dialog.destroy()
-            self._log(f"📂 {line_id}/{st_type} 源目录已更新：{len(dirs)} 个")
+        def save():
+            st["dirs"] = [lb.get(i) for i in range(lb.size())]
+            self._refresh_table()
+            self.save_cfg()
+            dlg.destroy()
+            self._log(f"📂 {st['line']}/{st['station']} 目录已更新: {len(st['dirs'])} 个")
 
-        tk.Button(
-            dialog, text="💾 保存", command=save_dirs,
-            bg=STYLE["success"], fg="white",
-            font=("Microsoft YaHei", 10, "bold"), relief="flat",
-            padx=20, pady=6
-        ).pack(pady=(0, 10))
+        tk.Button(dlg, text="💾 保存", command=save,
+                  bg=STYLE["success"], fg="white",
+                  font=("Microsoft YaHei", 11, "bold"),
+                  relief="flat", padx=24, pady=8).pack(pady=(0, 12))
 
-    def _toggle_station(self):
-        line_id, st_type = self._get_selected()
-        if not line_id or not st_type or line_id not in self.lines:
+    # ═══ 采集流程 ═══
+    def _start(self):
+        srv = self.server.get().strip()
+        if not srv or not os.path.exists(srv):
+            messagebox.showerror("错误", f"服务器路径不存在:\n{srv}")
             return
-        if st_type not in self.lines[line_id]:
-            return
-        st_cfg = self.lines[line_id][st_type]
-        st_cfg["enabled"] = not st_cfg.get("enabled", True)
-        self._refresh_line_tree()
-        self.save_config()
-
-    def _delete_selected(self):
-        line_id, st_type = self._get_selected()
-        if st_type and line_id in self.lines and st_type in self.lines[line_id]:
-            if messagebox.askyesno("确认", f"删除站别 {line_id}/{st_type}？"):
-                del self.lines[line_id][st_type]
-                if not self.lines[line_id]:
-                    del self.lines[line_id]
-                self._refresh_line_tree()
-                self.save_config()
-        elif line_id and line_id in self.lines:
-            if messagebox.askyesno("确认", f"删除线体 {line_id} 及其所有站别？"):
-                del self.lines[line_id]
-                self._refresh_line_tree()
-                self.save_config()
-
-    # ═══════════════════════════════════════════
-    # 服务器路径
-    # ═══════════════════════════════════════════
-    def _pick_server(self):
-        path = filedialog.askdirectory(title="选择服务器根目录")
-        if path:
-            self.server_root.set(path.replace("\\", "/"))
-            self.save_config()
-            self._log(f"🖥 服务器路径: {path}")
-
-    # ═══════════════════════════════════════════
-    # 日志
-    # ═══════════════════════════════════════════
-    def _log(self, message):
-        def append():
-            self.log_text.config(state="normal")
-            ts = datetime.datetime.now().strftime("%H:%M:%S")
-            self.log_text.insert(tk.END, f"[{ts}] {message}\n")
-            self.log_text.see(tk.END)
-            # 限制 500 行
-            lines = int(self.log_text.index('end-1c').split('.')[0])
-            if lines > 500:
-                self.log_text.delete('1.0', f'{lines - 500}.0')
-            self.log_text.config(state="disabled")
-        self.root.after(0, append)
-
-    # ═══════════════════════════════════════════
-    # 采集主流程
-    # ═══════════════════════════════════════════
-    def _start_collection(self):
-        server = self.server_root.get().strip()
-        if not server:
-            messagebox.showerror("错误", "请先配置服务器路径")
-            return
-        if not os.path.exists(server):
-            messagebox.showerror("错误", f"服务器路径不存在:\n{server}")
-            return
-        if not self.lines:
-            messagebox.showwarning("提示", "请先添加线体和站别")
+        enabled = [s for s in self.stations if s.get("enabled", True) and s.get("dirs")]
+        if not enabled:
+            messagebox.showwarning("提示", "没有已启用且配置了源目录的站别")
             return
 
-        self.save_config()
-        tm = TriggerManager(server)
-        tm.ensure_trigger_dir()
-
-        # 收集启用站别
-        self.pending_stations = []
-        self.station_status.clear()
-
-        for line_id, stations in self.lines.items():
-            for st_type, st_cfg in stations.items():
-                if not st_cfg.get("enabled", True):
-                    continue
-                # 更新 target_root
-                st_cfg["target_root"] = server
-                source_paths = tm.build_source_paths(st_cfg, server)
-                st_cfg["source_paths"] = source_paths
-
-                self.pending_stations.append((line_id, st_type))
-                self.station_status[(line_id, st_type)] = "waiting"
-
-        if not self.pending_stations:
-            messagebox.showwarning("提示", "没有启用的站别")
-            return
-
-        # 写入所有 trigger
-        self._log(f"🚀 开始采集 — {len(self.pending_stations)} 个站别")
-        written = tm.write_all_triggers(self.lines, log_cb=self._log)
-
-        # 刷新状态面板
-        self._refresh_status()
-
-        # 切到监控模式
+        self.save_cfg()
         self.monitoring = True
-        self.start_btn.config(state="disabled", text="⏳ 监控中...")
-        self.stop_btn.config(state="normal")
-        self.status_var.set(f"等待 {len(self.pending_stations)} 个站别响应...")
-        self.progress_var.set(0)
+        self.go_btn.config(state="disabled", text="⏳ 采集中...", bg=STYLE["sub"])
+        self.pending = [(s["line"], s["station"]) for s in enabled]
+        self.status.clear()
+        for l, st in self.pending:
+            self.status[(l, st)] = "waiting"
 
-        self.monitor_thread = threading.Thread(
-            target=self._monitor_loop,
-            args=(tm,),
-            daemon=True
-        )
-        self.monitor_thread.start()
+        self._refresh_status_table()
+        self.prog["value"] = 0
+        self.prog_label.config(text="正在写入触发指令...")
 
-    def _monitor_loop(self, tm):
-        total = len(self.pending_stations)
-        timeout = 600  # 10 分钟超时
-        start_time = time.time()
+        tm = TriggerManager(srv)
+        tm.dir and os.makedirs(tm.dir, exist_ok=True)
 
-        while self.monitoring and self.pending_stations:
-            all_done_now = []
-            for line_id, st_type in list(self.pending_stations):
-                done = tm.check_done(line_id, st_type)
-                if done:
-                    files = done.get("files_copied", 0)
-                    errors = done.get("errors", 0)
-                    status = "done" if errors == 0 else "error"
-                    self.station_status[(line_id, st_type)] = status
-                    all_done_now.append((line_id, st_type, files, errors))
-                    self.pending_stations.remove((line_id, st_type))
-                    self._log(
-                        f"✅ {line_id}/{st_type} 完成"
-                        + (f" ({files} 文件)" if files else "")
-                        + (f" ⚠️ {errors} 异常" if errors else "")
-                    )
+        for s in enabled:
+            tm.write(s["line"], s["station"], srv, s["dirs"])
+            self._log(f"📤 写入 trigger → {s['line']}/{s['station']}")
 
-            done_count = total - len(self.pending_stations)
-            self.root.after(0, lambda: self.progress_var.set(
-                done_count / total * 90
-            ))
-            self.root.after(0, self._refresh_status)
+        self._log(f"🚀 已触发 {len(enabled)} 个站别，等待机台响应...")
+        self._sbar(f"等待 {len(enabled)} 个站别同步...")
 
-            if not self.pending_stations:
+        threading.Thread(target=self._monitor, args=(tm, len(enabled)), daemon=True).start()
+
+    def _monitor(self, tm, total):
+        start = time.time()
+        while self.monitoring and self.pending:
+            done_now = []
+            for line, st in list(self.pending):
+                d = tm.check(line, st)
+                if d:
+                    errs = d.get("errors", 0)
+                    self.status[(line, st)] = "done" if errs == 0 else "error"
+                    done_now.append((line, st, d))
+                    self.pending.remove((line, st))
+
+            for line, st, d in done_now:
+                files = d.get("files_copied", 0)
+                errs = d.get("errors", 0)
+                emoji = "✅" if errs == 0 else "⚠️"
+                self._log(f"{emoji} {line}/{st} 完成 — {files} 文件" + (f", {errs} 异常" if errs else ""))
+
+            done = total - len(self.pending)
+            self.root.after(0, lambda: self.prog["value"] = done / total * 90)
+            self.root.after(0, lambda: self.prog_label.config(text=f"{done}/{total} 站别完成"))
+            self.root.after(0, self._refresh_status_table)
+            self.root.after(0, lambda: self._sbar(f"采集中... {done}/{total} 完成"))
+
+            if not self.pending:
                 break
 
-            # 超时检查
-            if time.time() - start_time > timeout:
-                self._log(f"⚠️ 超时 — {len(self.pending_stations)} 个站别无响应:")
-                for line_id, st_type in self.pending_stations:
-                    self.station_status[(line_id, st_type)] = "error"
-                    self._log(f"  ❌ {line_id}/{st_type} 超时")
-                self.root.after(0, self._refresh_status)
-                self.root.after(0, self._on_collection_done)
+            if time.time() - start > TIMEOUT:
+                for l, st in self.pending:
+                    self.status[(l, st)] = "error"
+                    self._log(f"❌ {l}/{st} 超时无响应")
+                self.root.after(0, self._refresh_status_table)
+                self.root.after(0, self._done)
                 return
 
-            self.root.after(0, lambda: self.status_var.set(
-                f"收集中... {done_count}/{total} 完成"
-            ))
             time.sleep(POLL_INTERVAL)
 
-        # 全部完成
-        self.root.after(0, lambda: self.status_var.set("✅ 全部采集完成！开始分析..."))
-        self.root.after(0, self._refresh_status)
-        self.root.after(0, self._on_collection_done)
+        self.root.after(0, self._done)
 
-    def _on_collection_done(self):
+    def _done(self):
         self.monitoring = False
-        self.stop_btn.config(state="disabled")
+        self.go_btn.config(state="normal", text="🚀 重新采集", bg=STYLE["accent"])
+        self.prog_label.config(text="采集完成，开始分析...")
+        self.prog["value"] = 92
+        self._refresh_status_table()
 
-        # 检查是否有成功完成的站别
-        has_data = any(
-            v == "done" for v in self.station_status.values()
-        )
+        has_data = any(v == "done" for v in self.status.values())
         if not has_data:
-            self.start_btn.config(state="normal", text="🚀 重新采集")
-            self.status_var.set("❌ 所有站别均失败，请检查配置")
+            self._sbar("所有站别均失败")
+            self.prog_label.config(text="❌ 采集失败")
             return
 
-        # 自动跑分析
         self._run_analysis()
 
     def _run_analysis(self):
-        """采集完成后自动跑 Analyzer"""
-        date_str = self.date_var.get()
-        server = self.server_root.get()
-
-        # 构建数据路径：server/2026-06-23/
-        data_root = os.path.join(server, date_str)
+        srv = self.server.get()
+        date_str = self.date.get()
+        data_root = os.path.join(srv, date_str)
 
         if not os.path.exists(data_root):
-            self._log(f"⚠️ 数据目录不存在: {data_root}")
-            self.start_btn.config(state="normal", text="🚀 重新采集")
-            self.status_var.set("数据目录不存在，请检查日期")
-            return
-
-        # 输出目录（本地）
-        local_output = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "reports", date_str
-        )
-
-        self._log(f"🔍 开始分析 {data_root} ...")
-        self.progress_var.set(95)
-
-        def analysis_thread():
+            # 尝试找服务器上最新的日期目录
             try:
-                bridge = AnalyzerBridge()
-                html_path, analysis = bridge.run_analysis(
-                    data_root, local_output, log_cb=self._log
-                )
-                self.root.after(0, lambda: self.progress_var.set(100))
-                self.root.after(0, lambda: self.status_var.set(
-                    f"✅ 报告已生成"
-                ))
+                dirs = sorted([d for d in os.listdir(srv) if os.path.isdir(os.path.join(srv, d)) and len(d) == 10 and d[4] == '-'], reverse=True)
+                if dirs:
+                    data_root = os.path.join(srv, dirs[0])
+                    self._log(f"⚠️ 指定日期目录不存在，使用最新: {dirs[0]}")
+            except:
+                pass
 
-                # 弹出报告
-                if html_path and os.path.exists(html_path):
-                    self._log(f"📄 打开报告: {html_path}")
-                    try:
-                        if sys.platform == "win32":
-                            os.startfile(html_path)
-                        elif sys.platform == "darwin":
-                            subprocess.run(["open", html_path])
-                        else:
-                            subprocess.run(["xdg-open", html_path])
-                    except Exception:
-                        self._log("⚠️ 无法自动打开报告，请手动打开")
+        out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports", date_str)
+        self._log(f"🔍 分析路径: {data_root}")
 
-                # 同时复制报告到服务器
+        def analyze():
+            try:
+                hp, a = AnalyzerBridge.run(data_root, out_dir, self._log)
+                self.last_report = hp
+                self.root.after(0, lambda: self.prog["value"] == 100)
+                self.root.after(0, lambda: self.prog_label.config(text="✅ 分析完成！"))
+                self.root.after(0, lambda: self.rpt_btn.config(state="normal"))
+                self.root.after(0, lambda: self.rpt_dir_btn.config(state="normal"))
+                self.root.after(0, lambda: self._sbar(f"✅ 报告已生成"))
+
+                # 复制到服务器
                 try:
                     import shutil
-                    server_report_dir = os.path.join(server, "reports")
-                    os.makedirs(server_report_dir, exist_ok=True)
-                    shutil.copy2(
-                        html_path,
-                        os.path.join(server_report_dir, f"{date_str}_report.html")
-                    )
-                    self._log(f"📤 报告已同步到服务器")
+                    rd = os.path.join(srv, "reports")
+                    os.makedirs(rd, exist_ok=True)
+                    shutil.copy2(hp, os.path.join(rd, f"{date_str}_report.html"))
+                    self._log(f"📤 报告已同步到服务器: {rd}")
                 except Exception as e:
-                    self._log(f"⚠️ 报告同步到服务器失败: {e}")
+                    self._log(f"⚠️ 同步报告失败: {e}")
+
+                # 弹出
+                if hp and os.path.exists(hp):
+                    self._log("📄 自动打开报告...")
+                    try:
+                        if sys.platform == "win32":
+                            os.startfile(hp)
+                        elif sys.platform == "darwin":
+                            subprocess.run(["open", hp])
+                        else:
+                            subprocess.run(["xdg-open", hp])
+                    except:
+                        pass
 
             except Exception as e:
-                self._log(f"❌ 分析失败: {e}")
                 import traceback
+                self._log(f"❌ 分析失败: {e}")
                 self._log(traceback.format_exc())
-                self.root.after(0, lambda: self.status_var.set(f"❌ 分析失败: {e}"))
+                self.root.after(0, lambda: self.prog_label.config(text=f"❌ {e}"))
+                self.root.after(0, lambda: self._sbar(f"❌ 分析失败"))
 
-            finally:
-                self.root.after(0, lambda: self.start_btn.config(
-                    state="normal", text="🚀 重新采集"
-                ))
+        threading.Thread(target=analyze, daemon=True).start()
 
-        threading.Thread(target=analysis_thread, daemon=True).start()
+    def _refresh_status_table(self):
+        for i in self.st_tbl.get_children():
+            self.st_tbl.delete(i)
+        for (l, st), s in sorted(self.status.items()):
+            icons = {"waiting": ("⏳ 等待中", "wait"), "done": ("✅ 完成", "ok"), "error": ("❌ 失败", "err")}
+            icon, tag = icons.get(s, ("🔄 进行中", ""))
+            cfg = next((x for x in self.stations if x["line"] == l and x["station"] == st), {})
+            detail = ", ".join([os.path.basename(d) for d in cfg.get("dirs", [])]) if cfg.get("dirs") else ""
+            self.st_tbl.insert("", "end", values=(l, st, icon, detail), tags=(tag,))
 
-    def _stop_monitoring(self):
-        self.monitoring = False
-        self.stop_btn.config(state="disabled")
-        self.start_btn.config(state="normal", text="🚀 开始采集")
-        self.status_var.set("已取消监控")
-        self._log("⏹ 用户取消监控")
+    # ═══ 报告 ═══
+    def _open_report(self):
+        if self.last_report and os.path.exists(self.last_report):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(self.last_report)
+                elif sys.platform == "darwin":
+                    subprocess.run(["open", self.last_report])
+                else:
+                    subprocess.run(["xdg-open", self.last_report])
+            except:
+                messagebox.showinfo("提示", f"报告位置:\n{self.last_report}")
+        else:
+            messagebox.showinfo("提示", "暂无报告")
 
-    # ═══════════════════════════════════════════
-    # 状态面板
-    # ═══════════════════════════════════════════
-    def _refresh_status(self):
-        for item in self.status_tree.get_children():
-            self.status_tree.delete(item)
+    def _open_outdir(self):
+        d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports", self.date.get())
+        if os.path.exists(d):
+            try:
+                if sys.platform == "win32":
+                    os.startfile(d)
+                else:
+                    subprocess.run(["xdg-open", d])
+            except:
+                pass
+        else:
+            messagebox.showinfo("提示", "输出目录不存在")
 
-        for (line_id, st_type), status in sorted(self.station_status.items()):
-            if status == "waiting":
-                icon = "⏳ 等待中"
-                tag = ""
-            elif status == "done":
-                icon = "✅ 完成"
-                tag = "done"
-            elif status == "error":
-                icon = "❌ 失败"
-                tag = "error"
-            else:
-                icon = f"🔄 {status}"
-                tag = ""
+    # ═══ 工具 ═══
+    def _browse(self, var):
+        p = filedialog.askdirectory(title="选择目录")
+        if p:
+            var.set(p.replace("\\", "/"))
+            self.save_cfg()
 
-            st_cfg = self.lines.get(line_id, {}).get(st_type, {})
-            dirs = st_cfg.get("source_dirs", [])
-            detail = ", ".join([os.path.basename(d) for d in dirs]) if dirs else ""
+    def _log(self, msg):
+        def do():
+            self.log.config(state="normal")
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+            self.log.insert(tk.END, f"[{ts}] {msg}\n")
+            self.log.see(tk.END)
+            # 限制行数
+            n = int(self.log.index('end-1c').split('.')[0])
+            if n > 500:
+                self.log.delete('1.0', f'{n - 500}.0')
+            self.log.config(state="disabled")
+        self.root.after(0, do)
 
-            self.status_tree.insert(
-                "", "end",
-                values=(line_id, st_type, icon, detail),
-                tags=(tag,)
-            )
+    def _clear_log(self):
+        self.log.config(state="normal")
+        self.log.delete("1.0", tk.END)
+        self.log.config(state="disabled")
 
-        # 颜色标记
-        self.status_tree.tag_configure("done", foreground=STYLE["success"])
-        self.status_tree.tag_configure("error", foreground=STYLE["danger"])
+    def _sbar(self, msg):
+        self.sbar_text.config(text=msg)
 
 
-# ═══════════════════════════════════════════════
-# 入口
-# ═══════════════════════════════════════════════
 def main():
     root = tk.Tk()
-    MasterControlApp(root)
+    App(root)
     root.mainloop()
 
 
